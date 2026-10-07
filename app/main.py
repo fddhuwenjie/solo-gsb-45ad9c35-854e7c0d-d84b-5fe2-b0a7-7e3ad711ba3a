@@ -26,6 +26,17 @@ Workflow
    and reviewer labels but recomputes per-sample correctness and all three
    correct counts against that revision's truth. The plain batch/results
    queries always keep returning the sealed original.
+7. The arbiter can also open an independent re-evaluation of a sealed batch
+   (``POST .../reevaluations``), naming the truth revision to use. The
+   service snapshots that revision's sample codes, categories and truth into
+   a brand new batch with fresh reviewer and arbiter credentials; the
+   re-evaluation then runs through the same submit/adjudicate/seal flow.
+   Once the re-evaluation is sealed, ``GET .../comparison`` lists, in sample
+   order, both rounds' final classifications (the source round taken from
+   the sealed original), a per-sample change flag, each round's correctness
+   and the two rounds' correct totals -- all evaluated against the chosen
+   revision's truth. Later errata on the source never change the snapshot or
+   the comparison.
 """
 
 from __future__ import annotations
@@ -81,6 +92,12 @@ class ErrataRequest(BaseModel):
     expected_revision: int
     # list (not dict) so duplicate codes in one request can be rejected
     corrections: list[CorrectionItem]
+
+
+class ReevaluationRequest(BaseModel):
+    # errata revision of the source whose truth the new round snapshots
+    # (0 = the sealed original)
+    truth_revision: int
 
 
 # --------------------------------------------------------------------------
@@ -366,36 +383,56 @@ def logic_create_batch(store: Store, payload: CreateBatchRequest) -> dict:
                 422, f"true_label {s.true_label!r} of sample {s.code!r} is not in allowed_categories"
             )
 
+    specs = [(s.code, s.true_label) for s in payload.samples]
+    with store.write() as conn:
+        batch_id, r1_token, r2_token, arb_token = _provision_batch(conn, categories, specs)
+    return _batch_created_payload(
+        batch_id, len(specs), r1_token, r2_token, arb_token
+    )
+
+
+def _provision_batch(conn, categories: list[str], specs: list[tuple[str, str]]):
+    """Insert a new batch row plus its samples inside the caller's transaction.
+
+    ``specs`` is an already-validated, already-ordered list of
+    ``(code, true_label)`` pairs. Returns the new batch id and three freshly
+    minted credentials (only their hashes are stored).
+    """
     batch_id = uuid.uuid4().hex
     reviewer1_token = secrets.token_urlsafe(32)
     reviewer2_token = secrets.token_urlsafe(32)
     arbiter_token = secrets.token_urlsafe(32)
-    with store.write() as conn:
-        conn.execute(
-            "INSERT INTO batches (id, allowed_categories, phase, reviewer1_token_hash,"
-            " reviewer2_token_hash, arbiter_token_hash, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (
-                batch_id,
-                json.dumps(categories),
-                "collecting",
-                _token_hash(reviewer1_token),
-                _token_hash(reviewer2_token),
-                _token_hash(arbiter_token),
-                _now(),
-            ),
-        )
-        conn.executemany(
-            "INSERT INTO samples (batch_id, position, code, true_label) VALUES (?,?,?,?)",
-            [(batch_id, i, s.code, s.true_label) for i, s in enumerate(payload.samples)],
-        )
+    conn.execute(
+        "INSERT INTO batches (id, allowed_categories, phase, reviewer1_token_hash,"
+        " reviewer2_token_hash, arbiter_token_hash, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (
+            batch_id,
+            json.dumps(categories),
+            "collecting",
+            _token_hash(reviewer1_token),
+            _token_hash(reviewer2_token),
+            _token_hash(arbiter_token),
+            _now(),
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO samples (batch_id, position, code, true_label) VALUES (?,?,?,?)",
+        [(batch_id, i, code, true_label) for i, (code, true_label) in enumerate(specs)],
+    )
+    return batch_id, reviewer1_token, reviewer2_token, arbiter_token
+
+
+def _batch_created_payload(
+    batch_id: str, sample_count: int, r1_token: str, r2_token: str, arb_token: str
+) -> dict:
     return {
         "batch_id": batch_id,
         "phase": "collecting",
-        "sample_count": len(payload.samples),
-        "reviewer1_token": reviewer1_token,
-        "reviewer2_token": reviewer2_token,
-        "arbiter_token": arbiter_token,
+        "sample_count": sample_count,
+        "reviewer1_token": r1_token,
+        "reviewer2_token": r2_token,
+        "arbiter_token": arb_token,
         "notice": "These credentials are shown only in this response and cannot be recovered.",
     }
 
@@ -702,6 +739,135 @@ def logic_get_errata(store: Store, batch_id: str, revision: int) -> dict:
         return _errata_version_payload(conn, batch, revision)
 
 
+def logic_create_reevaluation(
+    store: Store, source_batch_id: str, token: str | None, payload: ReevaluationRequest
+) -> dict:
+    """Snapshot a sealed batch's truth at one revision into a fresh batch.
+
+    The source must be sealed and the revision must exist. The whole read of
+    the revision state plus the creation of the new batch happens in one
+    ``BEGIN IMMEDIATE`` transaction, so an erratum interleaved with this call
+    can never make us snapshot samples from mixed revisions; any failure
+    rolls back and leaves no partial batch behind.
+    """
+    with store.write() as conn:
+        source = _get_batch(conn, source_batch_id)
+        _require_arbiter(source, token)
+        if source["phase"] != "sealed":
+            raise HTTPException(
+                409,
+                f"source batch is {source['phase']}; re-evaluations require a sealed source",
+            )
+        current = _current_revision(conn, source_batch_id)
+        revision = payload.truth_revision
+        if revision < 0 or revision > current:
+            raise HTTPException(
+                404,
+                f"source revision {revision} not found; latest revision is {current}",
+            )
+
+        categories = json.loads(source["allowed_categories"])
+        # All samples of one single revision state, read in sample order.
+        truth = _truth_at_revision(conn, source_batch_id, revision)
+        specs = [
+            (r["code"], truth[r["code"]])
+            for r in conn.execute(
+                "SELECT code FROM samples WHERE batch_id = ? ORDER BY position",
+                (source_batch_id,),
+            ).fetchall()
+        ]
+
+        new_batch_id, r1_token, r2_token, arb_token = _provision_batch(conn, categories, specs)
+        conn.execute(
+            "INSERT INTO reevaluations (batch_id, source_batch_id, truth_revision, created_at)"
+            " VALUES (?,?,?,?)",
+            (new_batch_id, source_batch_id, revision, _now()),
+        )
+
+    body = _batch_created_payload(new_batch_id, len(specs), r1_token, r2_token, arb_token)
+    body["source_batch_id"] = source_batch_id
+    body["truth_revision"] = revision
+    return body
+
+
+def logic_get_comparison(store: Store, batch_id: str) -> dict:
+    """Cross-round comparison for a sealed re-evaluation batch.
+
+    The source round's final classifications always come from the source's
+    immutable sealed original. Per-sample correctness and both correct totals
+    are evaluated against the chosen revision's truth, which is the truth
+    snapshotted into the re-evaluation batch at creation. The comparison is
+    unavailable (and reveals nothing) until the re-evaluation is sealed.
+    """
+    with store.read() as conn:
+        batch = _get_batch(conn, batch_id)
+        link = conn.execute(
+            "SELECT source_batch_id, truth_revision FROM reevaluations WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if link is None:
+            raise HTTPException(404, "batch is not a re-evaluation")
+        if batch["phase"] != "sealed":
+            # Blind: do not expose the source batch, its truth or the old
+            # round's classifications before the re-evaluation is sealed.
+            raise HTTPException(
+                409,
+                f"re-evaluation is {batch['phase']}; comparison is available only after sealing",
+            )
+
+        rows = conn.execute(
+            """
+            SELECT n.position AS position, n.code AS code,
+                   n.true_label AS true_label,
+                   n.final_label AS new_final,
+                   s.final_label AS source_final
+            FROM finals n
+            JOIN finals s
+              ON s.batch_id = ? AND s.code = n.code
+            WHERE n.batch_id = ?
+            ORDER BY n.position
+            """,
+            (link["source_batch_id"], batch_id),
+        ).fetchall()
+        # Invariant: the snapshot copied every source code, so the join
+        # covers all samples in both rounds.
+        results = []
+        source_correct_total = new_correct_total = 0
+        changed_count = 0
+        for r in rows:
+            source_ok = r["source_final"] == r["true_label"]
+            new_ok = r["new_final"] == r["true_label"]
+            changed = r["source_final"] != r["new_final"]
+            source_correct_total += source_ok
+            new_correct_total += new_ok
+            changed_count += changed
+            results.append(
+                {
+                    "code": r["code"],
+                    "source_final_label": r["source_final"],
+                    "reevaluation_final_label": r["new_final"],
+                    "changed": changed,
+                    "true_label": r["true_label"],
+                    "source_correct": source_ok,
+                    "reevaluation_correct": new_ok,
+                }
+            )
+        return {
+            "batch_id": batch_id,
+            "phase": "sealed",
+            "source_batch_id": link["source_batch_id"],
+            "truth_revision": link["truth_revision"],
+            "sealed_at": batch["sealed_at"],
+            "results": results,
+            "summary": {
+                "sample_count": len(results),
+                "changed_count": changed_count,
+                "source_correct": source_correct_total,
+                "reevaluation_correct": new_correct_total,
+            },
+        }
+
+
 # --------------------------------------------------------------------------
 # HTTP layer
 # --------------------------------------------------------------------------
@@ -775,6 +941,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.get("/batches/{batch_id}/errata/{revision}")
     def get_errata(batch_id: str, revision: int):
         return logic_get_errata(store, batch_id, revision)
+
+    @app.post("/batches/{batch_id}/reevaluations", status_code=201)
+    def create_reevaluation(
+        batch_id: str,
+        payload: ReevaluationRequest,
+        x_arbiter_token: str | None = Header(default=None),
+    ):
+        return logic_create_reevaluation(store, batch_id, x_arbiter_token, payload)
+
+    @app.get("/batches/{batch_id}/comparison")
+    def get_comparison(batch_id: str):
+        return logic_get_comparison(store, batch_id)
 
     return app
 

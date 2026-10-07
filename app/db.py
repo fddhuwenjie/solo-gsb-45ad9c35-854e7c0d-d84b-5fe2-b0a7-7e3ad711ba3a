@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS errata_items (
     PRIMARY KEY (batch_id, revision, code),
     FOREIGN KEY (batch_id, revision) REFERENCES errata (batch_id, revision)
 );
+
+-- Independent re-evaluation. The re-evaluation is a brand new, ordinary
+-- batches row whose samples snapshot the source batch's codes and truth at
+-- the chosen errata revision; later errata on the source never touch it.
+-- Source classifications for the cross-round comparison always come from the
+-- source's immutable sealed original (the ``finals`` table).
+CREATE TABLE IF NOT EXISTS reevaluations (
+    batch_id        TEXT PRIMARY KEY REFERENCES batches(id),
+    source_batch_id TEXT NOT NULL REFERENCES batches(id),
+    truth_revision  INTEGER NOT NULL CHECK (truth_revision >= 0),
+    created_at      TEXT NOT NULL
+);
 """
 
 

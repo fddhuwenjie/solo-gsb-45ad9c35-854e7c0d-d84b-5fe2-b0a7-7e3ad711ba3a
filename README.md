@@ -8,6 +8,8 @@
 4. **仲裁**：两份交卷齐全后，仲裁者凭专属凭据查看分歧样本及双方分类，逐项从两者中选择最终分类；一致样本直接取共同分类。**无分歧时第二份交卷即直接封存。**
 5. **封存揭盲**：分歧全部裁定后一次性封存。查询返回逐样本最终分类、真值、两名评审各自正确数。封存结果落库后不再变化。
 6. **揭盲勘误**：封存后若发现样本真值录错，仲裁者凭原凭据提交**期望修订号**与若干样本的更正真值，生成新的勘误版本。**版本 0 是封存原件**，后续版本只替换指定样本的真值；最终分类与两份评审分类永远不变。按版本查询会以该版真值重算逐样本正误与三方正确数，并列出本版相对上一版更正的样本。原有批次/结果查询始终返回封存原件。
+7. **独立复评**：已封存批次的仲裁者可凭原凭据发起独立复评，指定一个**真值修订号**。服务把该版的样本代号、允许类别与真值快照到一个**全新批次**，另发两份评审凭据 + 一份仲裁凭据；复评沿用同样的交卷、裁定、封存流程。复评封存前任何查询都不暴露来源批次、选定真值与上一轮分类。
+8. **跨轮对照**：复评封存后可查询两轮对照：按样本顺序给出两轮最终分类、变化标记、各自正误与两轮正确总数，**正误全部按复评选定的真值版本计算**；上一轮分类取自来源批次的**封存原件**。来源批次此后继续勘误不会改变复评快照或对照结果。
 
 ## 快速开始（单条命令）
 
@@ -40,6 +42,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 数据默认写入 ./data/bl
 | POST | `/batches/{id}/errata` | `X-Arbiter-Token` | 提交勘误：期望修订号 + 更正真值，生成下一版本（仅封存后） |
 | GET | `/batches/{id}/errata` | 无 | 列出版本链（0 = 封存原件，及每次勘误更正的样本） |
 | GET | `/batches/{id}/errata/{rev}` | 无 | 按版本查询：以该版真值重算的逐样本正误与三方正确数 |
+| POST | `/batches/{id}/reevaluations` | `X-Arbiter-Token`（来源批次） | 对已封存批次按指定真值修订号发起独立复评，返回新批次与三份新凭据 |
+| GET | `/batches/{新批次id}/comparison` | 无 | 跨轮对照（仅复评封存后可用）：两轮最终分类、变化标记、正误与正确总数 |
 | GET | `/healthz` | 无 | 健康检查 |
 
 阶段流转：`collecting`（收卷中）→ `adjudicating`（仲裁中，有分歧时）→ `sealed`（已封存揭盲）。
@@ -194,13 +198,93 @@ curl -sS http://localhost:8000/batches/$BID/errata/1
 
 `corrected` 列出本版相对上一版更正的样本（版本 0 为空）。`GET /batches/{id}` 与 `GET /batches/{id}/results` 不受勘误影响，始终返回版本 0 封存原件；`GET /batches/{id}/errata/0` 可查到与之一致的原始口径。
 
+### 8. 对已封存批次发起独立复评
+
+仲裁者凭**来源批次的原凭据**指定真值修订号（此处为版本 1：S02 真值已更正为 `cat`）。来源未封存（`409`）、凭据不是该批次仲裁凭据（`401`）或修订号不存在（`404`）都会被拒绝：
+
+```bash
+curl -sS -X POST http://localhost:8000/batches/$BID/reevaluations \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"truth_revision": 1}'
+```
+
+```json
+{
+  "batch_id": "3ce6...",
+  "phase": "collecting",
+  "sample_count": 3,
+  "reviewer1_token": "....",
+  "reviewer2_token": "....",
+  "arbiter_token": "....",
+  "notice": "These credentials are shown only in this response and cannot be recovered.",
+  "source_batch_id": "9f2c...",
+  "truth_revision": 1
+}
+```
+
+响应中的 `batch_id` 是**新批次**，三份凭据均为新签发，与来源批次互不通用；新批次的样本代号、类别与真值是选定修订版的快照。下文用 `$NBID`、`$NR1`、`$NR2`、`$NARB` 代指。
+
+复评批次沿用原有流程：盲态查询只有代号与阶段，封存前对照接口拒绝并暴露不出任何来源信息：
+
+```bash
+curl -sS http://localhost:8000/batches/$NBID
+# {"batch_id":"3ce6...","phase":"collecting","samples":["S01","S02","S03"]}
+
+curl -sS http://localhost:8000/batches/$NBID/comparison
+# 409: "re-evaluation is collecting; comparison is available only after sealing"
+```
+
+两名新评审交卷、新仲裁裁定后封存（与第 3、4 步完全相同的接口）：
+
+```bash
+curl -sS -X POST http://localhost:8000/batches/$NBID/submissions \
+  -H "X-Reviewer-Token: $NR1" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "cat"}}'
+
+curl -sS -X POST http://localhost:8000/batches/$NBID/submissions \
+  -H "X-Reviewer-Token: $NR2" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "dog", "S03": "bird"}}'
+
+curl -sS -X POST http://localhost:8000/batches/$NBID/adjudications \
+  -H "X-Arbiter-Token: $NARB" -H 'Content-Type: application/json' \
+  -d '{"decisions": {"S03": "cat"}}'
+```
+
+### 9. 跨轮对照
+
+复评封存后，按**样本顺序**返回两轮最终分类、变化标记与各自正误；正误与正确总数一律按复评选定的真值（本例版本 1：S02 = `cat`）计算，上一轮分类取自来源批次的封存原件（S02 仍为 `dog`）：
+
+```bash
+curl -sS http://localhost:8000/batches/$NBID/comparison
+```
+
+```json
+{
+  "batch_id": "3ce6...",
+  "phase": "sealed",
+  "source_batch_id": "9f2c...",
+  "truth_revision": 1,
+  "results": [
+    {"code": "S01", "source_final_label": "cat",  "reevaluation_final_label": "cat",  "changed": false, "true_label": "cat",  "source_correct": true,  "reevaluation_correct": true},
+    {"code": "S02", "source_final_label": "dog",  "reevaluation_final_label": "dog",  "changed": false, "true_label": "cat",  "source_correct": false, "reevaluation_correct": false},
+    {"code": "S03", "source_final_label": "bird", "reevaluation_final_label": "cat",  "changed": true,  "true_label": "bird", "source_correct": true,  "reevaluation_correct": false}
+  ],
+  "summary": {"sample_count": 3, "changed_count": 1, "source_correct": 2, "reevaluation_correct": 1}
+}
+```
+
+此后来源批次继续勘误（产生版本 2、3……）**不会**改变复评快照与对照；复评批次自己也可以勘误，但对照口径始终锚定创建时选定的真值版本。原批次的创建、交卷、裁定、封存与勘误接口行为均保持不变。
+
 ## 设计要点
 
 - **凭据**：`secrets.token_urlsafe(32)` 生成，数据库只存 SHA-256 哈希，仅在创建响应中明文返回一次；评审凭据与仲裁凭据角色互不通用（401）。
 - **不可改写**：交卷与裁定均有唯一约束与状态机保护，重复提交返回 `409` 且原数据不变。
 - **交错请求安全**：所有写操作在进程级锁内以 `BEGIN IMMEDIATE` 事务执行；校验失败整体回滚。封存时一次性写入不可变的 `finals` 结果表，揭盲查询只读该表——不会提前揭盲，也不会出现两份不同结果。
 - **勘误版本链**：勘误只追加 `errata` / `errata_items` 表，封存原件（`finals`）永不动。修订号从 0（封存原件）起严格递增；提交时校验 `expected_revision` 等于当前修订号，并发更正因此在同一事务内顺次生效、落后者以 `409 + current_revision` 拒绝，任何失败整体回滚、不留部分版本。按版本查询时用该版真值重算正误，最终分类与评审分类始终取自封存原件。
-- **持久化**：SQLite 文件（WAL 模式）落盘，Compose 挂载命名卷，重启后各勘误版本仍可查询。
+- **独立复评**：复评不是原批次的新版本，而是一个全新的普通批次（`batches` + `samples` 行），其真值在创建时即为选定修订版的**物化快照**；`reevaluations` 表只记录「新批次 → 来源批次 + 修订号」的链接。因此复评自动复用交卷/裁定/封存全部既有流程与约束，来源（或复评自身）此后的勘误只追加勘误表，不可能改动快照。创建仅接受来源批次的仲裁凭据；来源未封存返回 `409`，修订号不存在返回 `404`。
+- **复评创建的原子性**：读取选定版全部样本真值与写入新批次在同一个 `BEGIN IMMEDIATE` 事务内完成，与勘误写互斥——要么看到勘误前的完整版本，要么看到勘误后的完整版本，绝不会跨版本取到部分样本；任何校验失败整体回滚，不留部分批次、孤立样本或凭据。
+- **盲态与对照口径**：复评封存前，普通查询只给代号与阶段，评审查询只给自己的提交状态，`comparison` 返回 `409` 且不含来源 ID 或任何旧轮标签；`comparison` 挂在复评批次路径下，普通批次查询返回 `404`。对照中来源轮最终分类 JOIN 来源批次不可变的 `finals` 表（封存原件），正误用复评 `finals.true_label`（即选定版真值快照）重算，按复评样本顺序逐行给出。
+- **持久化**：SQLite 文件（WAL 模式）落盘，Compose 挂载命名卷，重启后各勘误版本及复评批次、跨轮对照仍可查询。
 
 ## 测试
 
@@ -209,4 +293,4 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-覆盖：完整流程（有/无分歧）、重复提交不改写、盲态信息隔离、凭据角色隔离、参数校验、并发重复交卷仅一人成功、交错请求不提前揭盲、重启后数据一致；勘误的版本链查询、校验整次拒绝、修订号过期返回当前值、并发更正仅一条生效、封存原件不受勘误影响。
+覆盖：完整流程（有/无分歧）、重复提交不改写、盲态信息隔离、凭据角色隔离、参数校验、并发重复交卷仅一人成功、交错请求不提前揭盲、重启后数据一致；勘误的版本链查询、校验整次拒绝、修订号过期返回当前值、并发更正仅一条生效、封存原件不受勘误影响；独立复评的版本快照、来源状态/版本/凭据校验、复评盲态隔离、复评封存后的跨轮对照口径、来源后续勘误与复评自身勘误均不改快照、创建与勘误交错时只取同一修订版全部样本且失败不留部分批次、新凭据与来源批次角色隔离、重启后复评与对照可查询。
