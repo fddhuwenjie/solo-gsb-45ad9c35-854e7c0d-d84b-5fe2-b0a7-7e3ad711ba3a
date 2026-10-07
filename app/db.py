@@ -23,7 +23,12 @@ CREATE TABLE IF NOT EXISTS batches (
     reviewer2_token_hash TEXT NOT NULL,
     arbiter_token_hash   TEXT NOT NULL,
     created_at           TEXT NOT NULL,
-    sealed_at            TEXT
+    sealed_at            TEXT,
+    -- Independent re-reviews snapshot a sealed source batch: the source batch
+    -- id plus the source errata revision whose truth was copied. Both are
+    -- NULL for ordinary batches and never change once the re-review is made.
+    source_batch_id      TEXT REFERENCES batches(id),
+    source_revision      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -90,6 +95,25 @@ CREATE TABLE IF NOT EXISTS errata_items (
 );
 """
 
+# Additive migrations for databases created before the re-review feature.
+MIGRATIONS = [
+    (
+        "source_batch_id",
+        "ALTER TABLE batches ADD COLUMN source_batch_id TEXT REFERENCES batches(id)",
+    ),
+    (
+        "source_revision",
+        "ALTER TABLE batches ADD COLUMN source_revision INTEGER",
+    ),
+]
+
+
+def _migrate(conn) -> None:
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
+    for column, statement in MIGRATIONS:
+        if column not in existing:
+            conn.execute(statement)
+
 
 class Store:
     """Thread-safe single-connection SQLite store."""
@@ -101,6 +125,7 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
+        _migrate(self.conn)
         self._lock = threading.RLock()
 
     @contextmanager

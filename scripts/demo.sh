@@ -64,3 +64,47 @@ curl -sS "$BASE/batches/$BID/errata/1" | python3 -m json.tool
 
 echo "== 12. plain results still return the sealed original (revision 0) =="
 curl -sS "$BASE/batches/$BID/results" | python3 -m json.tool
+
+echo "== 13. arbiter opens an independent re-review at truth revision 1 =="
+CREATE2=$(curl -sS -X POST "$BASE/batches/$BID/re-reviews" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"truth_revision": 1}')
+echo "$CREATE2" | python3 -m json.tool
+RR=$(json_get "d['batch_id']" <<<"$CREATE2")
+RR1=$(json_get "d['reviewer1_token']" <<<"$CREATE2")
+RR2=$(json_get "d['reviewer2_token']" <<<"$CREATE2")
+RRARB=$(json_get "d['arbiter_token']" <<<"$CREATE2")
+
+echo "== 14. the re-review is blind: only codes and phase, no source or truth =="
+curl -sS "$BASE/batches/$RR" | python3 -m json.tool
+# comparison is closed until the re-review is itself sealed
+curl -sS -o /dev/null -w "comparison while collecting -> %{http_code}\n" "$BASE/batches/$RR/comparison"
+
+echo "== 15. both new reviewers submit (they agree -> seals immediately) =="
+# reviewer labels use the corrected truth: S02 is cat; S03 stays bird
+curl -sS -X POST "$BASE/batches/$RR/submissions" \
+  -H "X-Reviewer-Token: $RR1" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "cat", "S03": "bird"}}' | python3 -m json.tool
+curl -sS -X POST "$BASE/batches/$RR/submissions" \
+  -H "X-Reviewer-Token: $RR2" -H 'Content-Type: application/json' \
+  -d '{"labels": {"S01": "cat", "S02": "cat", "S03": "bird"}}' | python3 -m json.tool
+
+echo "== 16. cross-round comparison (both rounds judged against revision 1 truth) =="
+curl -sS "$BASE/batches/$RR/comparison" | python3 -m json.tool
+
+echo "== 17. a new source erratum cannot change the re-review snapshot =="
+curl -sS -X POST "$BASE/batches/$BID/errata" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "corrections": [{"code": "S01", "true_label": "dog"}]}' \
+  | python3 -m json.tool
+curl -sS "$BASE/batches/$RR/comparison" | python3 -m json.tool
+
+echo "== 18. guards: unsealed source / missing revision / wrong credential =="
+curl -sS -o /dev/null -w "re-review at missing revision 9 -> %{http_code}\n" \
+  -X POST "$BASE/batches/$BID/re-reviews" \
+  -H "X-Arbiter-Token: $ARB" -H 'Content-Type: application/json' \
+  -d '{"truth_revision": 9}'
+curl -sS -o /dev/null -w "re-review with a reviewer token -> %{http_code}\n" \
+  -X POST "$BASE/batches/$BID/re-reviews" \
+  -H "X-Reviewer-Token: $R1" -H 'Content-Type: application/json' \
+  -d '{"truth_revision": 0}'
